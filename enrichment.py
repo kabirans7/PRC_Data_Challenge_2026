@@ -1,107 +1,256 @@
 """
-PRC Data Challenge 2026 - Data Enrichment
+PRC Data Challenge 2026 - Data Enrichment (final version)
 Author: Harsh (External Data & Feature Enrichment Lead)
 
-Builds leakage-safe features for each departing flight: time of day, weekend
-flag, recent traffic (15/30/60 min), weather (visibility, wind, temperature,
-fog, snow/ice) and a parking zone. Features are anchored on the actual
-off-block time (AOBT_3_flt), with the scheduled time (SCHED_TIME_UTC_mvt) as a
-fallback, because the test set has no BLOCK_TIME_UTC_mvt. Weather is read from a
-saved cache so the process runs offline and reproducibly.
+Builds leakage-safe features for every departing flight, for both the
+training months (2025) and the ranking set (Jan + Jul 2026).
+
+Anchor time = AOBT_3_flt (flight-plan off-block), falling back to
+SCHED_TIME_UTC_mvt when missing. BLOCK_TIME_UTC_mvt is NOT used because it is
+blank in the ranking file.
+
+Run:
+    python enrichment.py
+Inputs (same folder):
+    training_2025-*.parquet, ranking.parquet, weather_cache.parquet,
+    runways_10_airports.csv, osm_stands.csv (optional, for distance)
+Outputs:
+    enriched_features_train.parquet, enriched_features_ranking.parquet
 """
 
-import os, io, time
-from datetime import date
-import requests
+import glob
+import os
+
+import numpy as np
 import pandas as pd
 
 WEATHER_CACHE = "weather_cache.parquet"
+RUNWAYS = "runways_10_airports.csv"
+OSM_STANDS = "osm_stands.csv"
+
+WEATHER_COLS = ["visibility_miles", "wind_kt", "temp_c", "is_fog", "is_snow_ice"]
+RAW_COLS = ["MVT_ID_mvt", "ADEP_mvt", "ADES_mvt", "PHASE_mvt", "STAND_mvt", "RUNWAY_mvt",
+            "AOBT_3_flt", "SCHED_TIME_UTC_mvt", "MVT_TIME_UTC_mvt", "WK_TBL_CAT_flt",
+            "TAXITIME_SEC_mvt"]
+MIN_FLIGHTS = 10  # minimum flights for a stand+runway typical-time value
 
 
-def build_weather_cache(airports, start, end, path=WEATHER_CACHE):
-    base = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-    dates = (f"year1={start.year}&month1={start.month}&day1={start.day}"
-             f"&year2={end.year}&month2={end.month}&day2={end.day}")
-    frames = []
-    for i, code in enumerate(airports, 1):
-        print(f"[{i}/{len(airports)}] {code} ...", end=" ", flush=True)
-        url = f"{base}?data=all&tz=Etc/UTC&format=comma&latlon=no&missing=M&trace=T&{dates}&station={code}"
-        for attempt in range(3):
-            try:
-                r = requests.get(url, timeout=60); r.raise_for_status()
-                if "station,valid" not in r.text: raise ValueError("empty reply")
-                w = pd.read_csv(io.StringIO(r.text), comment="#", na_values="M").assign(airport=code)
-                frames.append(w); print(f"ok ({len(w)} rows)"); break
-            except Exception as e:
-                if attempt < 2: print("retry...", end=" ", flush=True); time.sleep(4)
-                else: print("FAILED:", repr(e))
-        time.sleep(1)
-    wx = pd.concat(frames, ignore_index=True)
-    wx["valid"] = pd.to_datetime(wx["valid"])
-    codes = wx["wxcodes"].fillna("")
-    wx["is_fog"]      = codes.str.contains("FG").astype(int)
-    wx["is_snow_ice"] = codes.str.contains("SN|FZ").astype(int)
-    wx["temp_c"]      = (wx["tmpf"] - 32) * 5/9
-    wx = wx.rename(columns={"vsby": "visibility_miles", "sknt": "wind_kt"})
-    wx = wx[["airport", "valid", "visibility_miles", "wind_kt", "temp_c", "is_fog", "is_snow_ice"]]
-    wx.to_parquet(path, index=False)
-    print(f"saved {len(wx)} real weather rows -> {path}")
-    return wx
+# ---------------------------------------------------------------- loading
+def load_raw(files):
+    parts = []
+    for f in files:
+        df = pd.read_parquet(f)
+        parts.append(df[[c for c in RAW_COLS if c in df.columns]])
+    d = pd.concat(parts, ignore_index=True)
+    for c in ["AOBT_3_flt", "SCHED_TIME_UTC_mvt", "MVT_TIME_UTC_mvt"]:
+        d[c] = pd.to_datetime(d[c], utc=True, errors="coerce")
+    return d
 
 
 def load_weather(path=WEATHER_CACHE):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"{path} not found - run build_weather_cache(...) once first.")
     wx = pd.read_parquet(path)
-    wx["valid"] = pd.to_datetime(wx["valid"])
-    if wx["valid"].dt.tz is None:
-        wx["valid"] = wx["valid"].dt.tz_localize("UTC")
-    return wx.sort_values("valid")
+    wx["valid"] = pd.to_datetime(wx["valid"], errors="coerce")
+    wx["valid"] = (wx["valid"].dt.tz_localize("UTC") if wx["valid"].dt.tz is None
+                   else wx["valid"].dt.tz_convert("UTC"))
+    wx = wx.dropna(subset=["valid", "airport"])
+    # deterministic: one report per airport+time (keep the last)
+    wx = wx.sort_values(["airport", "valid"]).drop_duplicates(["airport", "valid"], keep="last")
+    # a few reports lack a value: carry the previous report forward (past only)
+    wx[WEATHER_COLS] = wx.groupby("airport")[WEATHER_COLS].ffill()
+    return wx.sort_values("valid").reset_index(drop=True)
 
 
-def build_features(df, weather=None):
-    needed = ["MVT_ID_mvt", "ADEP_mvt", "STAND_mvt", "AOBT_3_flt", "SCHED_TIME_UTC_mvt"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"Input is missing required columns: {missing}.")
-    if weather is None:
-        weather = load_weather()
+# ---------------------------------------------------------------- helpers
+def count_before(event_times, query_times, minutes):
+    """For each query time t, count events with t - minutes <= event < t.
+    event_times must be sorted. Ties at exactly t are NOT counted (past only)."""
+    ev = np.asarray(event_times).astype("datetime64[ns]").astype("int64")
+    q = np.asarray(query_times).astype("datetime64[ns]").astype("int64")
+    w = np.int64(minutes * 60 * 1_000_000_000)
+    return np.searchsorted(ev, q, "left") - np.searchsorted(ev, q - w, "left")
 
-    d = df.copy()
-    if "PHASE_mvt" in d.columns:
-        d = d[d["PHASE_mvt"] == "DEP"].copy()
 
-    aobt  = pd.to_datetime(d["AOBT_3_flt"])
-    sched = pd.to_datetime(d["SCHED_TIME_UTC_mvt"])
-    anchor = aobt.fillna(sched)
-    if anchor.dt.tz is None:
-        anchor = anchor.dt.tz_localize("UTC")
-    d["anchor_time"] = anchor
+def haversine_km(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    a = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
+    return 6371.0 * 2 * np.arcsin(np.sqrt(a))
 
-    d["stand_area"] = d["STAND_mvt"].astype("string").str.strip().str[0].fillna("UNK")
 
-    ok = d[d["anchor_time"].notna()].copy()
-    ok["pushback_hour"] = ok["anchor_time"].dt.hour
-    ok["is_weekend"]    = (ok["anchor_time"].dt.dayofweek >= 5).astype(int)
+def norm_stand(s):
+    """Normalise stand codes so 'A 12', 'a12', 'A012' all become 'A12'."""
+    s = s.astype("string").str.upper().str.replace(r"[\s\-_/]", "", regex=True)
+    return s.str.replace(r"(?<=[A-Z])0+(?=\d)", "", regex=True).str.replace(r"^0+(?=\d)", "", regex=True)
 
-    ok = ok.sort_values(["ADEP_mvt", "anchor_time"])
-    for win in ["15min", "30min", "60min"]:
-        def _recent(g, win=win):
-            return g.set_index("anchor_time")["MVT_ID_mvt"].rolling(win, closed="left").count()
-        ok[f"planes_pushed_last_{win}"] = ok.groupby("ADEP_mvt", group_keys=False).apply(_recent).values
-        ok[f"planes_pushed_last_{win}"] = ok[f"planes_pushed_last_{win}"].fillna(0)
 
-    ok = ok.sort_values("anchor_time")
-    ok = pd.merge_asof(ok, weather, left_on="anchor_time", right_on="valid",
-                       left_by="ADEP_mvt", right_by="airport",
-                       direction="backward", tolerance=pd.Timedelta("2h"))
+# ---------------------------------------------------------------- features
+def build_features(raw, weather, stand_area_keep=None):
+    """Features for every DEP row of `raw` (one row per MVT_ID_mvt)."""
+    dep = raw[raw["PHASE_mvt"] == "DEP"].copy()
+    arr = raw[raw["PHASE_mvt"] == "ARR"]
 
-    feat_cols = ["pushback_hour", "is_weekend",
-                 "planes_pushed_last_15min", "planes_pushed_last_30min", "planes_pushed_last_60min",
-                 "visibility_miles", "wind_kt", "temp_c", "is_fog", "is_snow_ice"]
-    out = d[["MVT_ID_mvt", "stand_area"]].merge(ok[["MVT_ID_mvt"] + feat_cols], on="MVT_ID_mvt", how="left")
+    dep["aobt_missing"] = dep["AOBT_3_flt"].isna().astype(int)
+    dep["anchor_time"] = dep["AOBT_3_flt"].fillna(dep["SCHED_TIME_UTC_mvt"])
 
-    cols = ["MVT_ID_mvt", "pushback_hour", "is_weekend",
-            "planes_pushed_last_15min", "planes_pushed_last_30min", "planes_pushed_last_60min",
-            "visibility_miles", "wind_kt", "temp_c", "is_fog", "is_snow_ice", "stand_area"]
-    return out[cols].reset_index(drop=True)
+    # time
+    dep["pushback_hour"] = dep["anchor_time"].dt.hour
+    dep["is_weekend"] = (dep["anchor_time"].dt.dayofweek >= 5).astype(int)
+    dep["month"] = dep["anchor_time"].dt.month
+
+    # departure delay (minutes late leaving the stand vs schedule)
+    delay = (dep["AOBT_3_flt"] - dep["SCHED_TIME_UTC_mvt"]).dt.total_seconds() / 60
+    dep["dep_delay_min"] = delay.clip(-120, 600).fillna(0).round(1)
+
+    # traffic: departures pushed back / arrivals landed at the same airport before t
+    for c in ["planes_pushed_last_15min", "planes_pushed_last_30min",
+              "planes_pushed_last_60min", "arrivals_last_30min"]:
+        dep[c] = 0
+    for ap, idx in dep.groupby("ADEP_mvt").groups.items():
+        t = dep.loc[idx, "anchor_time"]
+        ev = np.sort(t.dropna().values)
+        ok = t.notna().values
+        for m in (15, 30, 60):
+            col = f"planes_pushed_last_{m}min"
+            vals = np.zeros(len(t), dtype=int)
+            vals[ok] = count_before(ev, t.values[ok], m)
+            dep.loc[idx, col] = vals
+        landed = np.sort(arr.loc[arr["ADES_mvt"] == ap, "MVT_TIME_UTC_mvt"].dropna().values)
+        vals = np.zeros(len(t), dtype=int)
+        vals[ok] = count_before(landed, t.values[ok], 30)
+        dep.loc[idx, "arrivals_last_30min"] = vals
+
+    # weather: latest report at or before anchor time
+    dep = dep.sort_values("anchor_time")
+    has_t = dep["anchor_time"].notna()
+    merged = pd.merge_asof(
+        dep.loc[has_t, ["MVT_ID_mvt", "ADEP_mvt", "anchor_time"]],
+        weather[["airport", "valid"] + WEATHER_COLS],
+        left_on="anchor_time", right_on="valid",
+        left_by="ADEP_mvt", right_by="airport", direction="backward")
+    dep = dep.merge(merged[["MVT_ID_mvt"] + WEATHER_COLS], on="MVT_ID_mvt", how="left")
+
+    # categories
+    dep["stand_area"] = dep["STAND_mvt"].astype("string").str.strip().str[0].fillna("UNK")
+    if stand_area_keep is None:  # decided on training data only, reused for ranking
+        share = dep["stand_area"].value_counts(normalize=True)
+        stand_area_keep = set(share[share >= 0.01].index)
+    dep.loc[~dep["stand_area"].isin(stand_area_keep), "stand_area"] = "OTHER"
+    dep["aircraft_size"] = (dep["WK_TBL_CAT_flt"].astype("string").str.strip().str.upper()
+                            .replace("", pd.NA).fillna("UNK"))
+    return dep, stand_area_keep
+
+
+# -------------------------------------------- typical stand+runway taxi time
+def add_typical_taxi(train_dep, rank_dep):
+    """Median and 10th-percentile taxi time per (airport, stand, runway).
+    Training rows: leave-one-month-out (a flight never sees its own month).
+    Ranking rows: from all 2025 months. Falls back to (airport, runway), then airport."""
+    # only plausible taxi times feed the statistics (1 min to 2 h)
+    ok = train_dep[train_dep["TAXITIME_SEC_mvt"].between(60, 7200)]
+    levels = [["ADEP_mvt", "STAND_mvt", "RUNWAY_mvt"], ["ADEP_mvt", "RUNWAY_mvt"], ["ADEP_mvt"]]
+
+    def stats(src):
+        out = []
+        for keys in levels:
+            g = src.groupby(keys)["TAXITIME_SEC_mvt"].agg(
+                n="size", med="median", p10=lambda x: x.quantile(0.10))
+            out.append((keys, g[g["n"] >= MIN_FLIGHTS]))
+        return out
+
+    def apply(target, st):
+        med = pd.Series(np.nan, index=target.index)
+        p10 = pd.Series(np.nan, index=target.index)
+        for keys, g in st:
+            m = target[keys].merge(g[["med", "p10"]], left_on=keys, right_index=True, how="left")
+            fill = med.isna() & m["med"].notna()
+            med[fill] = m.loc[fill, "med"]
+            p10[fill] = m.loc[fill, "p10"]
+        return med.round(0), p10.round(0)
+
+    train_dep = train_dep.copy()
+    train_dep["typical_taxi_sec"] = np.nan
+    train_dep["unimpeded_taxi_sec"] = np.nan
+    for mon in sorted(train_dep["month"].dropna().unique()):
+        rows = train_dep["month"] == mon
+        med, p10 = apply(train_dep[rows], stats(ok[ok["month"] != mon]))
+        train_dep.loc[rows, "typical_taxi_sec"] = med
+        train_dep.loc[rows, "unimpeded_taxi_sec"] = p10
+
+    rank_dep = rank_dep.copy()
+    rank_dep["typical_taxi_sec"], rank_dep["unimpeded_taxi_sec"] = apply(rank_dep, stats(ok))
+    return train_dep, rank_dep
+
+
+# ------------------------------------------------ stand -> runway distance
+def add_distance(dep, runways_path=RUNWAYS, stands_path=OSM_STANDS):
+    """Straight-line km from the stand (OpenStreetMap) to the start of the
+    departure runway (OurAirports threshold). NaN where the stand is not on the map."""
+    dep = dep.copy()
+    dep["stand_runway_km"] = np.nan
+    if not os.path.exists(stands_path):
+        print(f"  {stands_path} not found - distance feature skipped")
+        return dep
+
+    rw = pd.read_csv(runways_path)
+    ends = pd.concat([
+        rw[["airport_ident", "le_ident", "le_latitude_deg", "le_longitude_deg"]].set_axis(
+            ["ADEP_mvt", "RUNWAY_mvt", "rw_lat", "rw_lon"], axis=1),
+        rw[["airport_ident", "he_ident", "he_latitude_deg", "he_longitude_deg"]].set_axis(
+            ["ADEP_mvt", "RUNWAY_mvt", "rw_lat", "rw_lon"], axis=1)])
+    ends["RUNWAY_mvt"] = ends["RUNWAY_mvt"].astype(str)
+
+    st = pd.read_csv(stands_path)
+    st["key"] = norm_stand(st["ref"].fillna(st["name"]))
+    st = st.dropna(subset=["key"])
+    # where a code exists as both a parking position and a gate, use the parking position
+    st["prio"] = (st["aeroway"] != "parking_position").astype(int)
+    st = st[st["prio"] == st.groupby(["airport", "key"])["prio"].transform("min")]
+    st = st.groupby(["airport", "key"], as_index=False)[["lat", "lon"]].mean()
+    st = st.rename(columns={"airport": "ADEP_mvt", "lat": "st_lat", "lon": "st_lon"})
+
+    tmp = dep[["ADEP_mvt", "STAND_mvt", "RUNWAY_mvt"]].copy()
+    tmp["key"] = norm_stand(tmp["STAND_mvt"])
+    tmp["RUNWAY_mvt"] = tmp["RUNWAY_mvt"].astype(str)
+    tmp = tmp.merge(st, on=["ADEP_mvt", "key"], how="left").merge(
+        ends, on=["ADEP_mvt", "RUNWAY_mvt"], how="left")
+    dep["stand_runway_km"] = haversine_km(tmp["st_lat"].values, tmp["st_lon"].values,
+                                          tmp["rw_lat"].values, tmp["rw_lon"].values).round(3)
+    # a stand more than 8 km from its runway is a wrong match, not a real distance
+    dep.loc[dep["stand_runway_km"] > 8, "stand_runway_km"] = np.nan
+    return dep
+
+
+FINAL_COLS = [
+    "MVT_ID_mvt",
+    "pushback_hour", "is_weekend", "month",
+    "planes_pushed_last_15min", "planes_pushed_last_30min", "planes_pushed_last_60min",
+    "arrivals_last_30min",
+    "dep_delay_min", "aobt_missing",
+    "visibility_miles", "wind_kt", "temp_c", "is_fog", "is_snow_ice",
+    "stand_area", "aircraft_size",
+    "typical_taxi_sec", "unimpeded_taxi_sec", "stand_runway_km",
+]
+
+
+def main():
+    weather = load_weather()
+    train_raw = load_raw(sorted(glob.glob("training_2025-*.parquet")))
+    rank_raw = load_raw(["ranking.parquet"])
+
+    train_dep, keep = build_features(train_raw, weather)
+    rank_dep, _ = build_features(rank_raw, weather, stand_area_keep=keep)
+    train_dep, rank_dep = add_typical_taxi(train_dep, rank_dep)
+    train_dep = add_distance(train_dep)
+    rank_dep = add_distance(rank_dep)
+
+    cols = FINAL_COLS
+    if train_dep["stand_runway_km"].isna().all():
+        cols = [c for c in FINAL_COLS if c != "stand_runway_km"]
+    for name, d in [("train", train_dep), ("ranking", rank_dep)]:
+        out = d[cols].sort_values("MVT_ID_mvt").reset_index(drop=True)
+        out.to_parquet(f"enriched_features_{name}.parquet", index=False)
+        print(f"saved enriched_features_{name}.parquet {out.shape}")
+
+
+if __name__ == "__main__":
+    main()
