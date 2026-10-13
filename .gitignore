@@ -1,0 +1,21 @@
+# raw PRC Data Challenge files: large, not ours to redistribute, get them from the
+# challenge data portal (see HANDOVER.md) or a teammate, not from this repo
+training_2025-*.parquet
+ranking.parquet
+submitting.parquet
+
+# superseded Jan/Jul-only files from before the final phase added Feb+Jun. kept locally for
+# the paper's before/after comparison, not needed in the repo
+ranking_jan_jul2026.parquet
+enriched_features_ranking_jan_jul2026.parquet
+ranking_predictions_jan_jul2026.parquet
+
+# trained model files: 190MB+ joblib dump exceeds GitHub's 100MB hard limit, and binaries
+# don't belong in version control anyway. regenerate via the notebook's final cells instead
+*.joblib
+*.ubj
+
+# Jupyter / Python junk
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
