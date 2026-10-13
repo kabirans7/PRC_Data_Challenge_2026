@@ -51,8 +51,17 @@ Most important feature: `typical_taxi_sec` (44% of split gain). Largest error so
 - OpenStreetMap (© OpenStreetMap contributors, ODbL) via Overpass API: https://www.openstreetmap.org/copyright
 
 ## Team
+trustworthy-zipper
 
-Kamran (data cleaning), Harsh (external data and feature enrichment), Oscar (modelling and final submission), Kabir (repository).
+## Members 
+Kabir Ansari - BSc Business Information Systems, University of Westminster
+Maham Baber - BSc Data Science & Analytics, University of Westminster
+Oscar Denche - BSc Data Science & Analytics, University of Westminster
+Anahita Hessami - MSc Data Science & Analytics, University of Westminster
+Harsh Narendra - BSc Computer Science, University of Westminster
+Kamran Rzayev - MSc Data Science & Analytics, University of Westminster
+Elisa Schezzini - BSc Data Science & Analytics, University of Westminster
+Mihai-Catalin Vasile - MSc Data Science & Analytics, University of Westminster 
 
 ## License
 
